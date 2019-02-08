@@ -244,3 +244,95 @@ class PyDictReaderWorker(WorkerBase):
 
         selected_dataframe = data_frame.loc[partition_indexes == this_partition]
         return selected_dataframe.to_dict('records')
+
+class PyDictCarbonReaderWorker(WorkerBase):
+    def __init__(self, worker_id, publish_func, args):
+        super(PyDictCarbonReaderWorker, self).__init__(worker_id, publish_func, args)
+
+        self._filesystem = args[0]
+        self._dataset_path = args[1]
+        self._schema = args[2]
+        self._ngram = args[3]
+        self._split_pieces = args[4]
+        self._local_cache = args[5]
+        self._transform_spec = args[6]
+
+        # We create datasets lazily in the first invocation of 'def process'. This speeds up startup time since
+        # all Worker constructors are serialized
+        self._dataset = None
+
+    @staticmethod
+    def new_results_queue_reader():
+        return PyDictReaderWorkerResultsQueueReader()
+
+    # pylint: disable=arguments-differ
+    def process(self, piece_index, worker_predicate, shuffle_row_drop_partition):
+        """Main worker function. Loads and returns all rows matching the predicate from a rowgroup
+
+        Looks up the requested piece (a single row-group in a parquet file). If a predicate is specified,
+        columns needed by the predicate are loaded first. If no rows in the rowgroup matches the predicate criteria
+        the rest of the columns are not loaded.
+
+        :param piece_index:
+        :param shuffle_row_drop_partition: A tuple 2 of the current row drop partition and the total number
+            of partitions.
+        :return:
+        """
+
+        piece = self._split_pieces[piece_index]
+
+        if not isinstance(self._local_cache, NullCache):
+            if worker_predicate:
+                raise RuntimeError('Local cache is not supported together with predicates, '
+                                   'unless the dataset is partitioned by the column the predicate operates on.')
+            if shuffle_row_drop_partition[1] != 1:
+                raise RuntimeError('Local cache is not supported together with shuffle_row_drop_partitions > 1')
+
+            # Using hash of the dataset path with the relative path in order to:
+            #  1. Make sure if a common cache serves multiple processes (e.g. redis), we don't have conflicts
+            #  2. Dataset path is hashed, to make sure we don't create too long keys, which maybe incompatible with
+            #     some cache implementations
+            #  3. Still leave relative path and the piece_index in plain text to make it easier to debug
+        cache_key = '{}:{}:{}'.format(hashlib.md5(self._dataset_path.encode('utf-8')).hexdigest(),
+                                          piece.path, piece_index)
+        all_cols = self._local_cache.get(cache_key,
+                                             lambda: self._load_rows(piece, shuffle_row_drop_partition))
+
+        if self._ngram:
+            all_cols = self._ngram.form_ngram(data=all_cols, schema=self._schema)
+
+        if all_cols:
+            self.publish_func(all_cols)
+
+    def _load_rows(self, piece, shuffle_row_drop_range):
+        """Loads all rows from a piece"""
+
+        # pyarrow would fail if we request a column names that the dataset is partitioned by, so we strip them from
+        # the `columns` argument.
+        column_names = list(field.name for field in self._schema.fields.values())
+
+        all_rows = self._read_with_shuffle_row_drop(piece, column_names, shuffle_row_drop_range)
+
+        transform_func = self._transform_spec.func if self._transform_spec else (lambda x: x)
+        return [transform_func(utils.decode_row(row, self._schema)) for row in all_rows]
+
+    def _read_with_shuffle_row_drop(self, piece, column_names, shuffle_row_drop_partition):
+        data_frame = piece.read_all(
+            columns=column_names,
+        ).to_pandas()
+
+        num_rows = len(data_frame)
+        num_partitions = shuffle_row_drop_partition[1]
+        this_partition = shuffle_row_drop_partition[0]
+
+        partition_indexes = np.floor(np.arange(num_rows) / (float(num_rows) / min(num_rows, num_partitions)))
+
+        if self._ngram:
+            # If we have an ngram we need to take elements from the next partition to build the sequence
+            next_partition_indexes = np.where(partition_indexes >= this_partition + 1)
+            if next_partition_indexes[0].size:
+                next_partition_to_add = next_partition_indexes[0][0:self._ngram.length - 1]
+                partition_indexes[next_partition_to_add] = this_partition
+
+        selected_dataframe = data_frame.loc[partition_indexes == this_partition]
+        return selected_dataframe.to_dict('records')

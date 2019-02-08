@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from operator import attrgetter
 
 from pyarrow import parquet as pq
+from pyarrow.parquet import ParquetFile
 from six.moves import cPickle as pickle
 from six.moves.urllib.parse import urlparse
 
@@ -27,7 +28,7 @@ from petastorm import utils
 from petastorm.etl.legacy import depickle_legacy_package_name_compatible
 from petastorm.fs_utils import FilesystemResolver
 from petastorm.unischema import Unischema
-
+from petastorm.carbon import CarbonDataset
 logger = logging.getLogger(__name__)
 
 ROW_GROUPS_PER_FILE_KEY = b'dataset-toolkit.num_row_groups_per_file.v1'
@@ -131,6 +132,93 @@ def materialize_dataset(spark, dataset_url, schema, row_group_size_mb=None, use_
 
     _cleanup_spark(spark, spark_config, row_group_size_mb)
 
+@contextmanager
+def materialize_dataset_carbon(spark, dataset_url, schema, row_group_size_mb=None, use_summary_metadata=False,
+                        pyarrow_filesystem=None):
+    """
+    A Context Manager which handles all the initialization and finalization necessary
+    to generate metadata for a petastorm dataset. This should be used around your
+    spark logic to materialize a dataset (specifically the writing of parquet output).
+
+    Note: Any rowgroup indexing should happen outside the materialize_dataset block
+
+    Example:
+
+    >>> spark = SparkSession.builder...
+    >>> ds_url = 'hdfs:///path/to/my/dataset'
+    >>> with materialize_dataset(spark, ds_url, MyUnischema, 64):
+    >>>   spark.sparkContext.parallelize(range(0, 10)).
+    >>>     ...
+    >>>     .write.parquet(ds_url)
+    >>> indexer = [SingleFieldIndexer(...)]
+    >>> build_rowgroup_index(ds_url, spark.sparkContext, indexer)
+
+    A user may provide their own instance of pyarrow filesystem object in ``pyarrow_filesystem`` argument (otherwise,
+    petastorm will create a default one based on the url).
+
+    The following example shows how a custom pyarrow HDFS filesystem, instantiated using ``libhdfs`` driver can be used
+    during Petastorm dataset generation:
+
+    >>> resolver=FilesystemResolver(dataset_url, spark.sparkContext._jsc.hadoopConfiguration(),
+    >>>                             hdfs_driver='libhdfs')
+    >>> with materialize_dataset(..., pyarrow_filesystem=resolver.filesystem()):
+    >>>     ...
+
+
+    :param spark: The spark session you are using
+    :param dataset_url: The dataset url to output your dataset to (e.g. ``hdfs:///path/to/dataset``)
+    :param schema: The :class:`petastorm.unischema.Unischema` definition of your dataset
+    :param row_group_size_mb: The parquet row group size to use for your dataset
+    :param use_summary_metadata: Whether to use the parquet summary metadata for row group indexing or a custom
+      indexing method. The custom indexing method is more scalable for very large datasets.
+    :param pyarrow_filesystem: A pyarrow filesystem object to be used when saving Petastorm specific metadata to the
+      Parquet store.
+
+    """
+    # spark_config = {}
+    # _init_spark(spark, spark_config, row_group_size_mb, use_summary_metadata)
+    # yield
+
+    # After job completes, add the unischema metadata and check for the metadata summary file
+    spark_config = {}
+    _init_spark(spark, spark_config, row_group_size_mb, use_summary_metadata)
+    yield
+
+    # After job completes, add the unischema metadata and check for the metadata summary file
+    if pyarrow_filesystem is None:
+        resolver = FilesystemResolver(dataset_url, spark.sparkContext._jsc.hadoopConfiguration())
+        filesystem = resolver.filesystem()
+        dataset_path = resolver.get_dataset_path()
+    else:
+        filesystem = pyarrow_filesystem
+        dataset_path = urlparse(dataset_url).path
+
+    # dataset = pq.ParquetDataset(
+    #     dataset_path,
+    #     filesystem=filesystem,
+    #     validate_schema=False)
+    carbon_dataset = CarbonDataset(dataset_path)
+    _generate_unischema_metadata_carbon(carbon_dataset, schema)
+    if not use_summary_metadata:
+        _generate_num_blocklets_per_file_carbon(carbon_dataset, spark.sparkContext)
+
+    # Reload the dataset to take into account the new metadata
+    # dataset = pq.ParquetDataset(
+    #     dataset_path,
+    #     filesystem=filesystem,
+    #     validate_schema=False)
+    # try:
+    #     # Try to load the row groups, if it fails that means the metadata was not generated properly
+    #     load_row_groups(dataset)
+    # except PetastormMetadataError:
+    #     raise PetastormMetadataGenerationError(
+    #         'Could not find summary metadata file. The dataset will exist but you will need'
+    #         ' to execute petastorm-generate-metadata.py before you can read your dataset '
+    #         ' in order to generate the necessary metadata.'
+    #         ' Try increasing spark driver memory next time and making sure you are'
+    #         ' using parquet-mr >= 1.8.3')
+    #
+    _cleanup_spark(spark, spark_config, row_group_size_mb)
 
 def _init_spark(spark, current_spark_config, row_group_size_mb=None, use_summary_metadata=False):
     """
@@ -191,6 +279,18 @@ def _generate_unischema_metadata(dataset, schema):
     serialized_schema = pickle.dumps(schema)
     utils.add_to_dataset_metadata(dataset, UNISCHEMA_KEY, serialized_schema)
 
+def _generate_unischema_metadata_carbon(carbon_schema, schema):
+    """
+    Generates the serialized unischema and adds it to the dataset parquet metadata to be used upon reading.
+    :param dataset: (ParquetDataset) Dataset to attach schema
+    :param schema:  (Unischema) Schema to attach to dataset
+    :return: None
+    """
+    # TODO(robbieg): Simply pickling unischema will break if the UnischemaField class is changed,
+    #  or the codec classes are changed. We likely need something more robust.
+    serialized_schema = pickle.dumps(schema)
+    utils.add_to_dataset_metadata_carbon(carbon_schema, UNISCHEMA_KEY, serialized_schema)
+
 
 def _generate_num_row_groups_per_file(dataset, spark_context):
     """
@@ -227,6 +327,38 @@ def _generate_num_row_groups_per_file(dataset, spark_context):
     num_row_groups_str = json.dumps(dict(row_groups))
     # Add the dict for the number of row groups in each file to the parquet file metadata footer
     utils.add_to_dataset_metadata(dataset, ROW_GROUPS_PER_FILE_KEY, num_row_groups_str)
+
+def _generate_num_blocklets_per_file_carbon(carbon_dataset, spark_context):
+    """
+    Generates the metadata file containing the number of row groups in each file
+    for the parquet dataset located at the dataset_url. It does this in spark by
+    opening all parquet files in the dataset on the executors and collecting the
+    number of row groups in each file back on the driver.
+    :param dataset: :class:`pyarrow.parquet.ParquetDataset`
+    :param spark_context: spark context to use for retrieving the number of row groups
+    in each parquet file in parallel
+    :return: None, upon successful completion the metadata file will exist.
+    """
+    # if not isinstance(dataset.paths, str):
+    #     raise ValueError('Expected dataset.paths to be a single path, not a list of paths')
+    pieces  = carbon_dataset.pieces
+    # Get the common prefix of all the base path in order to retrieve a relative path
+    paths = [piece.path for piece in pieces]
+
+    # Needed pieces from the dataset must be extracted for spark because the dataset object is not serializable
+
+    # fs = dataset.fs
+    # base_path = dataset.paths
+    # TODO add number of blocklets for each carbonfile
+    def get_carbon_blocklet_info(path):
+        return path, 1
+
+    number_of_blocklets = spark_context.parallelize(paths, len(paths)) \
+        .map(get_carbon_blocklet_info) \
+        .collect()
+    number_of_blocklets_str = json.dumps(dict(number_of_blocklets))
+    # Add the dict for the number of row groups in each file to the parquet file metadata footer
+    utils.add_to_dataset_metadata_carbon(carbon_dataset, ROW_GROUPS_PER_FILE_KEY, number_of_blocklets_str)
 
 
 def load_row_groups(dataset):
@@ -364,6 +496,35 @@ def get_schema(dataset):
 
     return schema
 
+def get_schema_carbon(carbon_dataset):
+    """Retrieves schema object stored as part of dataset methadata.
+
+    :param dataset: an instance of :class:`pyarrow.parquet.ParquetDataset object`
+    :return: A :class:`petastorm.unischema.Unischema` object
+    """
+    if not carbon_dataset.common_metadata:
+        raise PetastormMetadataError(
+            'Could not find _common_metadata file. Use materialize_dataset(..) in'
+            ' petastorm.etl.dataset_metadata.py to generate this file in your ETL code.'
+            ' You can generate it on an existing dataset using petastorm-generate-metadata.py')
+    dataset_metadata_dict = carbon_dataset.common_metadata.metadata
+
+    # Read schema
+    if UNISCHEMA_KEY not in dataset_metadata_dict:
+        raise PetastormMetadataError(
+            'Could not find the unischema in the dataset common metadata file.'
+            ' Please provide or generate dataset with the unischema attached.'
+            ' Common Metadata file might not be generated properly.'
+            ' Make sure to use materialize_dataset(..) in petastorm.etl.dataset_metadata to'
+            ' properly generate this file in your ETL code.'
+            ' You can generate it on an existing dataset using petastorm-generate-metadata.py')
+    ser_schema = dataset_metadata_dict[UNISCHEMA_KEY]
+    # Since we have moved the unischema class around few times, unpickling old schemas will not work. In this case we
+    # override the old import path to get backwards compatibility
+
+    schema = depickle_legacy_package_name_compatible(ser_schema)
+
+    return schema
 
 def get_schema_from_dataset_url(dataset_url, hdfs_driver='libhdfs3'):
     """Returns a :class:`petastorm.unischema.Unischema` object loaded from a dataset specified by a url.
@@ -392,3 +553,13 @@ def infer_or_load_unischema(dataset):
         logger.info('Failed loading Unischema from metadata in %s. Assuming the dataset was not created with '
                     'Petastorm. Will try to construct from native Parquet schema.')
         return Unischema.from_arrow_schema(dataset)
+
+def infer_or_load_unischema_carbon(carbon_dataset):
+    """Try to recover Unischema object stored by ``materialize_dataset`` function. If it can be loaded, infer
+        Unischema from native Parquet schema"""
+    try:
+        return get_schema_carbon(carbon_dataset)
+    except PetastormMetadataError:
+        logger.info('Failed loading Unischema from metadata in %s. Assuming the dataset was not created with '
+                    'Petastorm. Will try to construct from native Parquet schema.')
+        return Unischema.from_carbon_arrow_schema(carbon_dataset)

@@ -236,3 +236,108 @@ class ArrowReaderWorker(WorkerBase):
                                          preserve_index=False)
 
         return table
+
+class ArrowCarbonReaderWorker(WorkerBase):
+    def __init__(self, worker_id, publish_func, args):
+        super(ArrowCarbonReaderWorker, self).__init__(worker_id, publish_func, args)
+
+        self._filesystem = args[0]
+        self._dataset_path = args[1]
+        self._schema = args[2]
+        self._ngram = args[3]
+        self._split_pieces = args[4]
+        self._local_cache = args[5]
+        self._transform_spec = args[6]
+
+        if self._ngram:
+            raise NotImplementedError('ngrams are not supported by ArrowReaderWorker')
+
+        # We create datasets lazily in the first invocation of 'def process'. This speeds up startup time since
+        # all Worker constructors are serialized
+        self._dataset = None
+
+    @staticmethod
+    def new_results_queue_reader():
+        return ArrowReaderWorkerResultsQueueReader()
+
+    # pylint: disable=arguments-differ
+    def process(self, piece_index, worker_predicate, shuffle_row_drop_partition):
+        """Main worker function. Loads and returns all rows matching the predicate from a rowgroup
+
+        Looks up the requested piece (a single row-group in a parquet file). If a predicate is specified,
+        columns needed by the predicate are loaded first. If no rows in the rowgroup matches the predicate criteria
+        the rest of the columns are not loaded.
+
+        :param piece_index:
+        :param shuffle_row_drop_partition: A tuple 2 of the current row drop partition and the total number
+            of partitions.
+        :return:
+        """
+
+        # if not self._dataset:
+        #     self._dataset = pq.ParquetDataset(
+        #         self._dataset_path,
+        #         filesystem=self._filesystem,
+        #         validate_schema=False)
+
+        piece = self._split_pieces[piece_index]
+
+        # Create pyarrow file system
+        # parquet_file = ParquetFile(self._dataset.fs.open(piece.path))
+
+        if not isinstance(self._local_cache, NullCache):
+            if worker_predicate:
+                raise RuntimeError('Local cache is not supported together with predicates, '
+                                   'unless the dataset is partitioned by the column the predicate operates on.')
+            if shuffle_row_drop_partition[1] != 1:
+                raise RuntimeError('Local cache is not supported together with shuffle_row_drop_partitions > 1')
+
+        # if worker_predicate:
+        #     all_cols = self._load_rows_with_predicate(parquet_file, piece, worker_predicate, shuffle_row_drop_partition)
+        # else:
+            # Using hash of the dataset path with the relative path in order to:
+            #  1. Make sure if a common cache serves multiple processes (e.g. redis), we don't have conflicts
+            #  2. Dataset path is hashed, to make sure we don't create too long keys, which maybe incompatible with
+            #     some cache implementations
+            #  3. Still leave relative path and the piece_index in plain text to make it easier to debug
+        cache_key = '{}:{}:{}'.format(hashlib.md5(self._dataset_path.encode('utf-8')).hexdigest(),
+                                          piece.path, piece_index)
+        all_cols = self._local_cache.get(cache_key,
+                                             lambda: self._load_rows(piece, shuffle_row_drop_partition))
+
+        if all_cols:
+            self.publish_func(all_cols)
+
+    def _load_rows(self, piece, shuffle_row_drop_range):
+        """Loads all rows from a piece"""
+
+        # pyarrow would fail if we request a column names that the dataset is partitioned by, so we strip them from
+        # the `columns` argument.
+        # partitions = self._dataset.partitions
+        column_names_in_schema = list(field.name for field in self._schema.fields.values())
+        # column_names = column_names_in_schema - partitions.partition_names
+
+        result = self._read_with_shuffle_row_drop(piece, column_names_in_schema, shuffle_row_drop_range)
+
+        if self._transform_spec:
+            result = pa.Table.from_pandas(self._transform_spec.func(result.to_pandas()), preserve_index=False)
+
+        return result
+
+    def _read_with_shuffle_row_drop(self, piece, column_names, shuffle_row_drop_partition):
+        table = piece.read_all(
+            columns=column_names,
+        )
+
+        num_rows = len(table)
+        num_partitions = shuffle_row_drop_partition[1]
+        this_partition = shuffle_row_drop_partition[0]
+
+        if num_partitions > 1:
+            data_frame_pandas = table.to_pandas()
+            partition_indexes = np.floor(np.arange(num_rows) / (float(num_rows) / min(num_rows, num_partitions)))
+
+            table = pa.Table.from_pandas(data_frame_pandas.loc[partition_indexes == this_partition],
+                                         preserve_index=False)
+
+        return table

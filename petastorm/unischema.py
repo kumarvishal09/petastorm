@@ -205,6 +205,18 @@ class Unischema(object):
         return self._get_namedtuple()(*args, **kargs)
 
     @classmethod
+    def from_carbon_arrow_schema(cls, carbon_dataset):
+        unischema_fields = []
+        arrow_schema = carbon_dataset.schema
+        for column_name in arrow_schema.names:
+            arrow_field = arrow_schema.field_by_name(column_name)
+            field_type = arrow_field.type
+            codec, np_type = _numpy_and_codec_from_arrow_type(field_type)
+
+            unischema_fields.append(UnischemaField(column_name, np_type, (), codec, arrow_field.nullable))
+        return Unischema('inferred_schema', unischema_fields)
+
+    @classmethod
     def from_arrow_schema(cls, parquet_dataset):
         """
         Convert an apache arrow schema into a unischema object. This is useful for datasets of only scalars
